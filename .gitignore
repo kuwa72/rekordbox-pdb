@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+
+# Local-only material (not part of the published library)
+/samson.pdb
+/FORMAT-LIBRARY-PLUS.md
+/library-plus-plan.md
+/usb-backups/
+/scratch/
