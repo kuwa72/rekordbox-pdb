@@ -1,6 +1,6 @@
 [project]
 name = "rekordbox-pdb"
-version = "0.1.0"
+version = "0.1.1"
 description = "Read and write the rekordbox export.pdb / exportExt.pdb databases from PIONEER USB exports"
 readme = "README.md"
 requires-python = ">=3.10"
