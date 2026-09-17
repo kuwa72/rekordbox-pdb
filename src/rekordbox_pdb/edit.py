@@ -57,6 +57,23 @@ TRACK_FIXED_FIELDS = {
 # File-type code at track row offset 0x5a, keyed by extension.
 FILE_TYPE_CODES = {".mp3": 0x01, ".m4a": 0x04, ".wav": 0x0B, ".aiff": 0x0C, ".aif": 0x0C}
 
+# Per-generation constants baked into every track row.  RB 6.x exports
+# carry bitmask 0xC0700, flag strings "2"/"2" and kuvo_public "ON";
+# Rekordbox 5.8.x exports carry bitmask 0x700, "1"/"\x01" and an empty
+# kuvo flag.  Players of the RB5 era (CDJ-350/800 etc.) pair with "rb5".
+_TRACK_PROFILES = {
+    "rb6": {
+        "bitmask": 0x000C0700,
+        "flags": ("2", "2"),
+        "kuvo_public": "ON",
+    },
+    "rb5": {
+        "bitmask": 0x00000700,
+        "flags": ("1", "\x01"),
+        "kuvo_public": "",
+    },
+}
+
 
 def _align4(n: int) -> int:
     return (n + 3) & ~3
@@ -95,6 +112,67 @@ class PdbEditor:
         self._touched_pages: dict[int, set[int]] = {}  # table type -> pages
         self._structural = False
         self.page_size = struct.unpack_from("<I", self._buf, 4)[0]
+        # Incremental bookkeeping for the append paths, populated once by
+        # _ensure_state(). Without it every row append invalidates self._db
+        # and the next self.db access re-parses the whole file, which makes
+        # a session with thousands of rows O(n^2) with a large constant.
+        self._state_ready = False
+        self._track_id_next = 1
+        self._unique_next = 0x00100001
+        self._name_ids: dict[int, dict[str, int]] = {}
+        self._id_next: dict[int, int] = {}
+        self._node_ids: set[int] = set()
+        self._is_folder: dict[int, bool] = {}
+        self._node_id_next = 1
+        self._sort_next: dict[int, int] = {}
+        self._entry_next: dict[int, int] = {}
+
+    # -- incremental state ---------------------------------------------------
+
+    def _ensure_state(self) -> None:
+        """Initialize counters and caches from the current buffer, once.
+
+        All values are derived from a single parse and then maintained
+        incrementally by the append paths, so the hot paths never need to
+        re-parse the buffer.  The produced bytes are identical to scanning
+        ``self.db`` on every call (row ids, the 0x14 unique values and the
+        sort orders are only ever monotonically increasing).
+        """
+        if self._state_ready:
+            return
+        db = self.db  # one parse for the whole session
+        self._state_ready = True
+
+        self._track_id_next = max((t.id for t in db.tracks), default=0) + 1
+        self._unique_next = max(
+            (self._u32(loc + 0x14)
+             for loc in db.row_locations(TableType.TRACKS)),
+            default=0x00100000,
+        ) + 1
+
+        for table_type in (
+            TableType.GENRES, TableType.ARTISTS, TableType.ALBUMS,
+            TableType.LABELS, TableType.KEYS,
+        ):
+            ids: dict[str, int] = {}
+            max_id = 0
+            for row in db.rows(table_type):
+                ids.setdefault(row.name, row.id)
+                max_id = max(max_id, row.id)
+            self._name_ids[table_type] = ids
+            self._id_next[table_type] = max_id + 1
+
+        self._node_ids = {n.id for n in db.playlist_tree}
+        self._is_folder = {n.id: bool(n.is_folder) for n in db.playlist_tree}
+        self._node_id_next = max((n.id for n in db.playlist_tree), default=0) + 1
+        for node in db.playlist_tree:
+            self._sort_next[node.parent_id] = max(
+                self._sort_next.get(node.parent_id, -1), node.sort_order)
+        for entry in db.playlist_entries:
+            self._entry_next[entry.playlist_id] = max(
+                self._entry_next.get(entry.playlist_id, 0), entry.entry_index)
+        self._entry_next = {
+            pid: index + 1 for pid, index in self._entry_next.items()}
 
     # -- construction / output ---------------------------------------------
 
@@ -306,10 +384,24 @@ class PdbEditor:
 
     def _get_or_create(self, table_type: int, name: str,
                        build) -> int:
-        for row in self.db.rows(table_type):
-            if row.name == name:
-                return row.id
-        new_id = max((r.id for r in self.db.rows(table_type)), default=0) + 1
+        self._ensure_state()
+        ids = self._name_ids.get(table_type)
+        if ids is None:
+            # Defensive: a lookup table not covered by _ensure_state.
+            db = self.db
+            ids = {}
+            max_id = 0
+            for row in db.rows(table_type):
+                ids.setdefault(row.name, row.id)
+                max_id = max(max_id, row.id)
+            self._name_ids[table_type] = ids
+            self._id_next[table_type] = max_id + 1
+        existing = ids.get(name)
+        if existing is not None:
+            return existing
+        new_id = self._id_next[table_type]
+        self._id_next[table_type] = new_id + 1
+        ids[name] = new_id
         row_bytes, alloc, shift_at = build(new_id, name)
         self._append_row(table_type, row_bytes, alloc, index_shift_at=shift_at)
         return new_id
@@ -386,6 +478,8 @@ class PdbEditor:
         rating: int = 0,
         color_id: int = 0,
         artwork_id: int = 0,
+        analyze_date: str | None = None,
+        profile: str = "rb6",
     ) -> int:
         """Add a track row; returns its id.
 
@@ -398,6 +492,15 @@ class PdbEditor:
             filename = file_path.rsplit("/", 1)[-1]
         if date_added is None:
             date_added = datetime.date.today().isoformat()
+        if analyze_date is None:
+            analyze_date = date_added
+        try:
+            prof = _TRACK_PROFILES[profile]
+        except KeyError:
+            raise ValueError(
+                f"unknown profile {profile!r}; "
+                f"expected one of {sorted(_TRACK_PROFILES)}"
+            ) from None
 
         # Validate everything that can fail BEFORE creating lookup rows,
         # so a bad argument can't leave orphan artist/album/... rows.
@@ -413,10 +516,10 @@ class PdbEditor:
             _check_range(name, value, size)
 
         strings = [
-            "", "", "2", "2", "",         # 0-4 (0 = ISRC, left empty)
-            "", "ON", "ON", "", "",       # 5-9 (kuvo_public, autoload_hotcues)
+            "", "", prof["flags"][0], prof["flags"][1], "",  # 0-4 (0 = ISRC)
+            "", prof["kuvo_public"], "ON", "", "",           # 5-9
             date_added, release_date, mix_name, "",
-            analyze_path, date_added,     # 14-15 (analyze_date)
+            analyze_path, analyze_date,   # 14-15 (analyze_date)
             comment, title, "", filename, file_path,
         ]
         encoded = [encode_string(s) for s in strings]
@@ -424,20 +527,19 @@ class PdbEditor:
         if alloc > self.page_size - PAGE_HEADER_SIZE - self._dir_bytes(1):
             raise ValueError("track row too large for one page")
 
+        self._ensure_state()
         artist_id = self.get_or_create_artist(artist) if artist else 0
         album_id = self.get_or_create_album(album, artist_id) if album else 0
         genre_id = self.get_or_create_genre(genre) if genre else 0
         key_id = self.get_or_create_key(key) if key else 0
         label_id = self.get_or_create_label(label) if label else 0
 
-        track_id = max((t.id for t in self.db.tracks), default=0) + 1
+        track_id = self._track_id_next
+        self._track_id_next = track_id + 1
         # Unique per-track value at 0x14 (purpose unknown; unique in
         # every real export, so keep it unique here too).
-        seen = {
-            self._u32(loc + 0x14)
-            for loc in self.db.row_locations(TableType.TRACKS)
-        }
-        unique = max(seen, default=0x00100000) + 1
+        unique = self._unique_next
+        self._unique_next = unique + 1
 
         ext = "." + file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
         file_type = FILE_TYPE_CODES.get(ext, 0x01)
@@ -445,7 +547,7 @@ class PdbEditor:
         fixed = struct.pack(
             "<HHIIIIIHH12IHHHHHHBBHH",
             0x0024, 0,                    # magic, index_shift (patched on append)
-            0x000C0700,                   # bitmask (constant in every export)
+            prof["bitmask"],              # bitmask (per-generation constant)
             sample_rate, 0,               # composer_id
             file_size, unique,
             0xAE49, 0x03DD,               # format constants
@@ -477,11 +579,13 @@ class PdbEditor:
 
     def create_playlist(self, name: str, parent_id: int = 0,
                         is_folder: bool = False) -> int:
-        nodes = self.db.playlist_tree
-        node_id = max((n.id for n in nodes), default=0) + 1
-        sort_order = max(
-            (n.sort_order for n in nodes if n.parent_id == parent_id),
-            default=-1) + 1
+        self._ensure_state()
+        node_id = self._node_id_next
+        self._node_id_next = node_id + 1
+        sort_order = self._sort_next.get(parent_id, -1) + 1
+        self._sort_next[parent_id] = sort_order
+        self._node_ids.add(node_id)
+        self._is_folder[node_id] = bool(is_folder)
         s = encode_string(name)
         row = struct.pack("<IIIII", parent_id, 0, sort_order, node_id,
                           1 if is_folder else 0) + s
@@ -490,13 +594,12 @@ class PdbEditor:
 
     def add_to_playlist(self, playlist_id: int, track_id: int,
                         entry_index: int | None = None) -> None:
-        nodes = {n.id: n for n in self.db.playlist_tree}
-        if playlist_id not in nodes or nodes[playlist_id].is_folder:
+        self._ensure_state()
+        if playlist_id not in self._node_ids or \
+                self._is_folder.get(playlist_id, False):
             raise LookupError(f"no playlist with id {playlist_id}")
         if entry_index is None:
-            entry_index = max(
-                (e.entry_index for e in self.db.playlist_entries
-                 if e.playlist_id == playlist_id),
-                default=0) + 1
+            entry_index = self._entry_next.get(playlist_id, 1)
+            self._entry_next[playlist_id] = entry_index + 1
         row = struct.pack("<III", entry_index, track_id, playlist_id)
         self._append_row(TableType.PLAYLIST_ENTRIES, row, 12)
