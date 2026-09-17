@@ -163,6 +163,52 @@ class TestAddTrack:
         assert track.title == "Stavöstranos — épreuve"
 
 
+class TestTrackProfile:
+    def test_rb5_profile_constants(self, tmp_path):
+        """Rekordbox 5.x exports carry different fixed constants in the
+        track row; players of that era expect them."""
+        ed = PdbEditor.from_file(ONE_SONG)
+        tid = ed.add_track(
+            title="Legacy", file_path="/Contents/a/b/legacy.mp3",
+            profile="rb5",
+        )
+        out = tmp_path / "edited.pdb"
+        ed.save(out)
+
+        track = next(t for t in Database.from_file(out).tracks if t.id == tid)
+        assert track.bitmask == 0x00000700
+        assert track.strings[2] == "1"      # unknown_string_2
+        assert track.strings[3] == "\x01"   # unknown_string_3
+        assert track.strings[6] == ""       # kuvo_public
+        assert track.strings[7] == "ON"     # autoload_hotcues
+
+    def test_default_profile_is_rb6(self, tmp_path):
+        ed = PdbEditor.from_file(ONE_SONG)
+        tid = ed.add_track(title="x", file_path="/Contents/a/b/x.mp3")
+        out = tmp_path / "edited.pdb"
+        ed.save(out)
+        track = next(t for t in Database.from_file(out).tracks if t.id == tid)
+        assert track.bitmask == 0x000C0700
+        assert track.strings[6] == "ON"     # kuvo_public
+
+    def test_unknown_profile_rejected(self):
+        ed = PdbEditor.from_file(ONE_SONG)
+        with pytest.raises(ValueError):
+            ed.add_track(title="x", file_path="/Contents/a/b/x.mp3",
+                         profile="rb9")
+
+    def test_analyze_date_defaults_to_date_added(self, tmp_path):
+        ed = PdbEditor.from_file(ONE_SONG)
+        tid = ed.add_track(
+            title="x", file_path="/Contents/a/b/x.mp3",
+            date_added="2026-01-01", analyze_date="2026-01-02",
+        )
+        out = tmp_path / "edited.pdb"
+        ed.save(out)
+        track = next(t for t in Database.from_file(out).tracks if t.id == tid)
+        assert track.analyze_date == "2026-01-02"
+
+
 class TestPlaylists:
     def test_add_track_to_existing_playlist(self, tmp_path):
         ed = PdbEditor.from_file(ONE_SONG)
