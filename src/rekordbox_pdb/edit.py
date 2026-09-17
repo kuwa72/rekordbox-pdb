@@ -57,6 +57,23 @@ TRACK_FIXED_FIELDS = {
 # File-type code at track row offset 0x5a, keyed by extension.
 FILE_TYPE_CODES = {".mp3": 0x01, ".m4a": 0x04, ".wav": 0x0B, ".aiff": 0x0C, ".aif": 0x0C}
 
+# Per-generation constants baked into every track row.  RB 6.x exports
+# carry bitmask 0xC0700, flag strings "2"/"2" and kuvo_public "ON";
+# Rekordbox 5.8.x exports carry bitmask 0x700, "1"/"\x01" and an empty
+# kuvo flag.  Players of the RB5 era (CDJ-350/800 etc.) pair with "rb5".
+_TRACK_PROFILES = {
+    "rb6": {
+        "bitmask": 0x000C0700,
+        "flags": ("2", "2"),
+        "kuvo_public": "ON",
+    },
+    "rb5": {
+        "bitmask": 0x00000700,
+        "flags": ("1", "\x01"),
+        "kuvo_public": "",
+    },
+}
+
 
 def _align4(n: int) -> int:
     return (n + 3) & ~3
@@ -461,6 +478,8 @@ class PdbEditor:
         rating: int = 0,
         color_id: int = 0,
         artwork_id: int = 0,
+        analyze_date: str | None = None,
+        profile: str = "rb6",
     ) -> int:
         """Add a track row; returns its id.
 
@@ -473,6 +492,15 @@ class PdbEditor:
             filename = file_path.rsplit("/", 1)[-1]
         if date_added is None:
             date_added = datetime.date.today().isoformat()
+        if analyze_date is None:
+            analyze_date = date_added
+        try:
+            prof = _TRACK_PROFILES[profile]
+        except KeyError:
+            raise ValueError(
+                f"unknown profile {profile!r}; "
+                f"expected one of {sorted(_TRACK_PROFILES)}"
+            ) from None
 
         # Validate everything that can fail BEFORE creating lookup rows,
         # so a bad argument can't leave orphan artist/album/... rows.
@@ -488,10 +516,10 @@ class PdbEditor:
             _check_range(name, value, size)
 
         strings = [
-            "", "", "2", "2", "",         # 0-4 (0 = ISRC, left empty)
-            "", "ON", "ON", "", "",       # 5-9 (kuvo_public, autoload_hotcues)
+            "", "", prof["flags"][0], prof["flags"][1], "",  # 0-4 (0 = ISRC)
+            "", prof["kuvo_public"], "ON", "", "",           # 5-9
             date_added, release_date, mix_name, "",
-            analyze_path, date_added,     # 14-15 (analyze_date)
+            analyze_path, analyze_date,   # 14-15 (analyze_date)
             comment, title, "", filename, file_path,
         ]
         encoded = [encode_string(s) for s in strings]
@@ -519,7 +547,7 @@ class PdbEditor:
         fixed = struct.pack(
             "<HHIIIIIHH12IHHHHHHBBHH",
             0x0024, 0,                    # magic, index_shift (patched on append)
-            0x000C0700,                   # bitmask (constant in every export)
+            prof["bitmask"],              # bitmask (per-generation constant)
             sample_rate, 0,               # composer_id
             file_size, unique,
             0xAE49, 0x03DD,               # format constants
